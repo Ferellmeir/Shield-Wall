@@ -418,18 +418,24 @@ function maxStamina(man) {
 
 function effectiveStat(man, key) {
   const base = man.stats[key] || 0;
-  if (!man.injuries || man.injuries.length === 0 || man.isLeader) return base;
+
+  if (!man.injuries || man.injuries.length === 0 || man.isLeader) {
+    return base;
+  }
+
   let multiplier = 1;
+
   man.injuries.forEach((injury) => {
-    const relevant = {
-      Arm: ["strength", "weapon", "ranged"],
-      Leg: ["agility", "speed", "pillaging", "manhunting"],
-      Abdomen: ["stamina", "recovery", "toughness"],
-      Head: ["discipline", "intelligence", "repair"],
-    }[injury.part] || [];
-    if (relevant.includes(key)) multiplier *= injury.permanent ? 0.8 : 0.5;
+    const effects = injury.permanent
+      ? PERMANENT_INJURY_EFFECTS[injury.part]
+      : INJURY_EFFECTS[injury.part];
+
+    if (effects && effects[key]) {
+      multiplier *= (100 - effects[key]) / 100;
+    }
   });
-  return clamp(base * multiplier);
+
+  return clamp(Math.round(base * multiplier));
 }
 
 function createLeader() {
@@ -1906,12 +1912,75 @@ function moraleModifier(side, battle) {
 
 function inflictInjury(defender, attacker, battle, side) {
   attacker.battle.injuries += 1;
+
   if (defender.isLeader || defender.type === "Enemy") return;
+
   const part = ["Arm", "Leg", "Abdomen", "Head"][randInt(0, 3)];
-  defender.injuries.push({ part, months: randInt(1, 3), permanent: false });
+
+  defender.injuries.push({
+    part,
+    months: randInt(1, 3),
+    permanent: false,
+    stats: { ...INJURY_EFFECTS[part] }
+  });
+
   if (side === "player") battle.enemyMorale -= 5;
   else battle.playerMorale -= 5;
 }
+
+const INJURY_EFFECTS = {
+  Arm: {
+    weapon: 50,
+    ranged: 50,
+    strength: 50
+  },
+
+  Leg: {
+    agility: 50,
+    speed: 50,
+    pillaging: 50,
+    manhunting: 50
+  },
+
+  Abdomen: {
+    stamina: 50,
+    recovery: 50,
+    toughness: 50
+  },
+
+  Head: {
+    discipline: 50,
+    intelligence: 50,
+    repair: 50
+  }
+};
+
+const PERMANENT_INJURY_EFFECTS = {
+  Arm: {
+    weapon: 20,
+    ranged: 20,
+    strength: 20
+  },
+
+  Leg: {
+    agility: 20,
+    speed: 20,
+    pillaging: 20,
+    manhunting: 20
+  },
+
+  Abdomen: {
+    stamina: 20,
+    recovery: 20,
+    toughness: 20
+  },
+
+  Head: {
+    discipline: 20,
+    intelligence: 20,
+    repair: 20
+  }
+};
 
 function incapacitate(man) {
   if (man.isLeader) {
@@ -2364,9 +2433,20 @@ function healInjuries() {
     });
     man.injuries = man.injuries.flatMap((injury) => {
       if (injury.months > 0) return [injury];
-      const becomesPermanent = chance(clamp(0.5 - effectiveStat(man, "luck") * 0.0025, 0.1, 0.5));
-      if (becomesPermanent) return [{ ...injury, permanent: true, months: 999 }];
-      return [];
+      const becomesPermanent = chance(
+  clamp(0.5 - effectiveStat(man, "luck") * 0.0025, 0.1, 0.5)
+);
+
+if (becomesPermanent) {
+  return [{
+    ...injury,
+    permanent: true,
+    months: 999,
+    stats: { ...PERMANENT_INJURY_EFFECTS[injury.part] }
+  }];
+}
+
+return [];
     });
   });
   state.leader.hp = maxHp(state.leader);
@@ -2619,6 +2699,12 @@ function helpView() {
 
       <p>Every shield equipped grants <b>+1 formation score</b>.</p>
 
+      <h3>Combat</h3>
+      <p>Battles are fought one round at a time. Before combat begins, any warriors with bows fire a volley. Each round, both shield walls make attack rolls based on Agility and equipment, with the faster side acting first. Successful attacks deal damage based on Strength and weapon quality, while armor reduces incoming damage. Every hit lowers enemy morale, and slain warriors cause additional morale loss. Fighters can be swapped with reserves between rounds, and the Jarl may Rally once per battle to restore morale. The battle ends when one shield wall is destroyed or its morale breaks. Victory earns spoils, experience, and training, while defeat forces the crew to retreat with no loot.
+
+      <h3>Injuries</h3>
+      <p>Powerful hits may inflict injuries to the arms, legs, abdomen, or head. Injuries reduce the effectiveness of the related stats by 50% until they heal. When an injury heals, it has a 50% chance (reduced by Luck) to become permanent, leaving a lasting 20% penalty instead.
+
       <h3>Formations</h3>
 
       <p><b>Boar's Snout</b> - Lowers enemy morale.</p>
@@ -2630,11 +2716,8 @@ function helpView() {
 
       <p>Training after battle depends on Intelligence and Trainer.</p>
 
-      <h3>Equipment</h3>
-
-      <p><b>Weapons</b> increase damage.</p>
-      <p><b>Armor</b> reduces incoming damage.</p>
-      <p><b>Shields</b> are required for shield wall formations.</p>
+      <h3>Gold & Spoils</h3>
+      <p>After a victorious raid, the crew divides the plunder into equal shares. The Jarl receives three shares, while each active crew member receives one. Only the Jarl's share is added to your gold.
 
     </div>
   `;
@@ -2713,7 +2796,7 @@ function storeView() {
         <div class="card">
           <h3>Equipment Guide</h3>
 
-          <p><strong>Shield</strong> – Required for shield wall formations. Bring at least 5 men with shields to avoid a 25% moral penalty. Each shield in the wall gives <strong>+1 formation score</strong>.</p>
+          <p><strong>Shield</strong> – Required for shield wall formations. Bring at least 5 men with shields to avoid a 25% morale penalty. Each shield in the wall gives <strong>+1 formation score</strong>.</p>
 
           <p><strong>Spear</strong> – One-handed weapon, +2% chance to attack.</p>
 
@@ -3104,22 +3187,36 @@ function crewRow(man) {
   <span class="tiny muted">${injuryText(man)}</span>
   <h4>Combat Stats</h4>
 <div class="stat-grid">
-  ${(man.isLeader ? LEADER_COMBAT_STATS : COMBAT_STATS).map(key =>
-    `<span class="stat-pill">
+  ${(man.isLeader ? LEADER_COMBAT_STATS : COMBAT_STATS).map(key => {
+  const penalty = injuryPenalty(man, key);
+
+  return `
+    <span class="stat-pill">
       <span>${STAT_DEFS[key]}</span>
-      <strong>${formatStat(man.stats[key] || 0)}</strong>
-    </span>`
-  ).join("")}
+      <strong>
+        ${formatStat(man.stats[key] || 0)}
+        ${penalty > 0 ? `<span style="color:#d44;">(-${formatStat(penalty)})</span>` : ""}
+      </strong>
+    </span>
+  `;
+}).join("")}
 </div>
 
 <h4>Auxiliary Stats</h4>
 <div class="stat-grid">
-  ${AUXILIARY_STATS.map(key =>
-    `<span class="stat-pill">
+  ${AUXILIARY_STATS.map(key => {
+  const penalty = injuryPenalty(man, key);
+
+  return `
+    <span class="stat-pill">
       <span>${STAT_DEFS[key]}</span>
-      <strong>${formatStat(man.stats[key] || 0)}</strong>
-    </span>`
-  ).join("")}
+      <strong>
+        ${formatStat(man.stats[key] || 0)}
+        ${penalty > 0 ? `<span style="color:#d44;">(-${formatStat(penalty)})</span>` : ""}
+      </strong>
+    </span>
+  `;
+}).join("")}
 </div>
 ${man.isLeader ? `
 <h4>Leader Stats</h4>
@@ -3127,7 +3224,14 @@ ${man.isLeader ? `
   ${["command", "sailing", "management"].map((key) =>
     `<span class="stat-pill">
       <span>${STAT_DEFS[key]}</span>
-      <strong>${formatStat(man.stats[key] || 0)}</strong>
+      <strong>
+  ${formatStat(effectiveStat(man, key))}
+  ${
+    injuryPenalty(man, key)
+      ? `<span class="injuryPenalty">(-${injuryPenalty(man, key)})</span>`
+      : ""
+  }
+</strong>
     </span>`
   ).join("")}
 </div>
@@ -3152,6 +3256,12 @@ ${man.isLeader ? `
       <td>${man.isLeader ? "Jarl" : `<button class="danger" data-action="fire" data-id="${man.id}">Fire</button>`}</td>
     </tr>
   `;
+}
+
+function injuryPenalty(man, key) {
+  const base = man.stats[key] || 0;
+  const current = effectiveStat(man, key);
+  return Math.max(0, base - current);
 }
 
 function equipmentSelect(man, slot, options, current) {
@@ -3242,7 +3352,6 @@ function drawBattle() {
   drawLine(ctx, players, 185, 285, "#2c7a7b", true);
   drawLine(ctx, enemies, 715, 285, "#9f2f2f", false);
   drawReserves(ctx, battle.reserves.map(findMan).filter(Boolean), 170, 360, "#607744");
-  drawLabels(ctx, battle);
 }
 
 function drawLine(ctx, men, xCenter, yBase, color, facingRight) {

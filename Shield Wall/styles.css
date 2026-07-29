@@ -585,6 +585,12 @@ input[type="number"] {
   }
 }
 
+.injuryPenalty {
+  color: #d33;
+  font-weight: bold;
+  margin-left: 3px;
+}
+
 @media (max-width: 620px) {
   .content {
     padding: 12px;
