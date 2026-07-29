@@ -76,13 +76,14 @@ const TRAINING_STATS = Object.keys(STAT_DEFS).filter(
 const LEADER_TRAINING_STATS = TRAINING_STATS
   .filter((stat) => stat !== "discipline" && stat !== "luck")
   .concat(["command", "sailing", "management"]);
+const LEADER_COMBAT_STATS = COMBAT_STATS.filter((stat) => stat !== "discipline");
 const WEAPONS = ["spear", "axe", "sword", "daneAxe", "bow"];
 const ARMORS = ["none", "hauberk"];
 const HELMS = ["none", "helm"];
 
 const EQUIPMENT = {
   supplies: { label: "Supplies", cost: 1, sell: 0 },
-  shield: { label: "Shield", cost: 3, sell: 1 },
+  shield: { label: "Shield", cost: 3, sell: 1,formationBonus: 1 }, // +1% formation success chance
   spear: { label: "Spear", cost: 4, sell: 2, attack: 0.02, hit: 0, damage: 0 },
   axe: { label: "Axe", cost: 4, sell: 2, attack: 0, hit: 0, damage: 2 },
   sword: { label: "Sword", cost: 8, sell: 4, attack: 0.01, hit: 0.03, damage: 1 },
@@ -207,6 +208,68 @@ let importAsOpponent = false;
 
 const app = document.querySelector("#app");
 
+let bgMusic = document.getElementById("bgMusic");
+let raidMusic = document.getElementById("raidMusic");
+let currentMusicTrack = null;
+let musicFadeTimer = null;
+
+function playMusic(track) {
+  const next = track === "raid" ? raidMusic : bgMusic;
+  const current = currentMusicTrack === "raid" ? raidMusic : currentMusicTrack === "home" ? bgMusic : null;
+
+  if (!next) return;
+  if (currentMusicTrack === track && !next.paused) return;
+
+  clearInterval(musicFadeTimer);
+
+  const startNext = () => {
+    currentMusicTrack = track;
+    next.volume = 0;
+    next.play().catch(() => {});
+    fadeVolume(next, 1);
+  };
+
+  if (current && !current.paused && current !== next) {
+    fadeVolume(current, 0, () => {
+      current.pause();
+      startNext();
+    });
+  } else {
+    startNext();
+  }
+}
+
+function stopAllMusic() {
+  clearInterval(musicFadeTimer);
+  bgMusic.pause();
+  raidMusic.pause();
+  currentMusicTrack = null;
+}
+
+function fadeVolume(audio, targetVolume, onComplete) {
+  const duration = 900;
+  const stepMs = 50;
+  const startVolume = audio.volume;
+  const change = targetVolume - startVolume;
+  let elapsed = 0;
+
+  clearInterval(musicFadeTimer);
+  musicFadeTimer = setInterval(() => {
+    elapsed += stepMs;
+    const progress = Math.min(1, elapsed / duration);
+    audio.volume = clamp(startVolume + change * progress, 0, 1);
+    if (progress >= 1) {
+      clearInterval(musicFadeTimer);
+      audio.volume = targetVolume;
+      if (onComplete) onComplete();
+    }
+  }, stepMs);
+}
+
+function raidLocked() {
+  return !!state.raid;
+}
+
 const IMAGE_SOURCES = {
   battleBackground: "Background.png",
   default: "Viking Sprite.png",
@@ -251,6 +314,9 @@ function getManSprite(man) {
 }
 
 function getBattleBackground() {
+  if (state?.raid?.importedOpponent && images.City?.complete && images.City.naturalWidth) {
+    return images.City;
+  }
   const location = state?.raid?.battle?.target || state?.raid?.destination;
   if (location && images[location] && images[location].complete && images[location].naturalWidth) {
     return images[location];
@@ -381,6 +447,8 @@ function createLeader() {
     stats,
     hp: 1,
     staminaNow: 100,
+     primary: "weapon",
+    secondary: "morale",
     equipment: { weapon: "axe", shield: true, armor: "none", helm: "none", bow: false },
     battle: null,
   };
@@ -495,8 +563,14 @@ function rollRecruitType() {
 }
 
 function refreshRecruits(initial = false) {
-  const count = initial ? 10 : 5 + state.recruitBonus;
-  state.recruits = Array.from({ length: count }, () => createCrew(rollRecruitRank(), rollRecruitType()));
+  const baseCount = initial ? 10 : 5;
+  const count = baseCount + state.recruitBonus;
+
+  state.recruits = Array.from(
+    { length: count },
+    () => createCrew(rollRecruitRank(), rollRecruitType())
+  );
+
   state.recruits.forEach((recruit) => {
     if (CREW_TYPES[recruit.type].gear) {
       recruit.equipment.weapon = chance(0.5) ? "spear" : "axe";
@@ -519,6 +593,7 @@ function createState() {
     recruitBonus: 0,
     voyageCount: 0,
     turn: 1,
+    seaEvent: null,
     inventory: {
       shield: 0,
       spear: 0,
@@ -538,6 +613,7 @@ function createState() {
   state = fresh;
   refreshRecruits(true);
   addLog("Take up your axe, Viking lord. Recruit your men, stock the longship, and make the Gods proud.");
+  playMusic("home");
   return fresh;
 }
 
@@ -594,6 +670,10 @@ function parseImportedState(rawText) {
   return parsed?.state ?? parsed;
 }
 
+function cloneGameState(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
 function buildOpponentRoster(importedState) {
   const members = [importedState.leader, ...(importedState.crew || [])].filter(Boolean);
   const roster = members.map((member, index) => {
@@ -621,6 +701,8 @@ function buildOpponentRoster(importedState) {
 }
 
 function createImportedOpponentRaid(enemyRoster, importedName = "Imported Opponent") {
+  const snapshot = cloneGameState(state);
+  const snapshotView = activeView;
   state.raid = {
     destination: importedName,
     targetIndex: 0,
@@ -634,6 +716,8 @@ function createImportedOpponentRaid(enemyRoster, importedName = "Imported Oppone
     report: null,
     complete: false,
     importedOpponent: true,
+    preBattleState: snapshot,
+    preBattleView: snapshotView,
   };
   state.raid.battle = {
     stage: "setup",
@@ -777,13 +861,41 @@ function spendGold(amount) {
 }
 
 function buySupplies(amount) {
+  if (raidLocked()) {
+  notify("You cannot do that while away on a raid.");
+  return;
+}
   if (!spendGold(amount)) return;
   state.supplies += amount;
   addLog(`Bought ${amount} supplies.`);
   render();
 }
 
+function buyMaxSupplies() {
+  if (raidLocked()) {
+    notify("You cannot do that while away on a raid.");
+    return;
+  }
+
+  if (state.gold <= 0) {
+    notify("You do not have any gold.");
+    return;
+  }
+
+  const amount = state.gold;
+
+  state.supplies += amount;
+  state.gold = 0;
+
+  addLog(`Bought ${amount} supplies.`);
+  render();
+}
+
 function buyItem(item, amount = 1) {
+  if (raidLocked()) {
+  notify("You cannot do that while away on a raid.");
+  return;
+}
   const cost = EQUIPMENT[item].cost * amount;
   if (!confirmSupplyWarning(cost)) return;
   if (!spendGold(cost)) return;
@@ -797,6 +909,10 @@ function buyItem(item, amount = 1) {
 }
 
 function sellItem(item) {
+  if (raidLocked()) {
+  notify("You cannot do that while away on a raid.");
+  return;
+}
   if ((state.inventory[item] || 0) < 1) return;
   state.inventory[item] -= 1;
   state.gold += EQUIPMENT[item].sell;
@@ -809,6 +925,10 @@ function landCost() {
 }
 
 function buyLand() {
+  if (raidLocked()) {
+  notify("You cannot do that while away on a raid.");
+  return;
+}
   const cost = landCost();
 
   if (!confirmSupplyWarning(cost)) return;
@@ -824,6 +944,10 @@ function buyLand() {
 }
 
 function sowField() {
+  if (raidLocked()) {
+  notify("You cannot do that while away on a raid.");
+  return;
+}
   const maxSown = 1 + state.land;
   if (state.sowedFields >= maxSown) {
     notify("No more prepared fields can be sown before the next voyage.");
@@ -836,19 +960,60 @@ function sowField() {
   render();
 }
 
+function slaveCost() {
+  return 20 + state.slaves * 5
+}
+
 function buySlave() {
-  if (!confirmSupplyWarning(20)) return;
-  if (!spendGold(20)) return;
+  if (raidLocked()) {
+    notify("You cannot do that while away on a raid.");
+    return;
+  }
+
+  const cost = slaveCost();
+
+  if (!confirmSupplyWarning(cost)) return;
+  if (!spendGold(cost)) return;
+
   state.slaves += 1;
-  addLog("Bought one slave for the home fjord. Passive income rose by 5 gold.");
+  addLog(`Bought one slave for ${cost} gold. Passive income rose by 5 gold.`);
+  render();
+}
+
+function skipTurn() {
+  if (raidLocked()) {
+    notify("You cannot skip time while away on a raid.");
+    return;
+  }
+
+  const income = passiveIncome();
+  state.gold += income;
+
+  state.voyageCount += 1;
+  state.turn = (state.turn || 1) + 1;
+  state.sowedFields = 0;
+
+  healInjuries();
+  refreshRecruits(false);
+
+  addLog(`The crew stayed at the Home Fjord. Farms, fields, and slaves produced ${income} gold.`);
+
   render();
 }
 
 function tentCost() {
-  return 20 + (state.recruitBonus / 5) * 20;
+  if (raidLocked()) {
+  notify("You cannot do that while away on a raid.");
+  return;
+}
+  return 20 + (state.recruitBonus / 10) * 20;
 }
 
 function enlargeTent() {
+  if (raidLocked()) {
+  notify("You cannot do that while away on a raid.");
+  return;
+}
   const cost = tentCost();
 
   if (!confirmSupplyWarning(cost)) return;
@@ -856,14 +1021,26 @@ function enlargeTent() {
 
   state.recruitBonus += 1;
 
-  addLog(
-    `Expanded the recruitment tent for ${cost} gold.`
-  );
+  // Add exactly one new recruit immediately.
+  const recruit = createCrew(rollRecruitRank(), rollRecruitType());
+
+  if (CREW_TYPES[recruit.type].gear) {
+    recruit.equipment.weapon = chance(0.5) ? "spear" : "axe";
+    recruit.equipment.shield = true;
+  }
+
+  state.recruits.push(recruit);
+
+  addLog(`Expanded the recruitment tent for ${cost} gold.`);
 
   render();
 }
 
 function hireRecruit(id) {
+  if (raidLocked()) {
+  notify("You cannot do that while away on a raid.");
+  return;
+}
   const recruit = state.recruits.find((candidate) => candidate.id === id);
   if (!recruit) return;
   const cost = recruitCost(recruit);
@@ -876,6 +1053,10 @@ function hireRecruit(id) {
 }
 
 function fireCrew(id) {
+  if (raidLocked()) {
+  notify("You cannot do that while away on a raid.");
+  return;
+}
   const man = state.crew.find((candidate) => candidate.id === id);
   if (!man) return;
   unequipAll(man);
@@ -885,6 +1066,10 @@ function fireCrew(id) {
 }
 
 function toggleCrewActive(id) {
+  if (raidLocked()) {
+  notify("You cannot do that while away on a raid.");
+  return;
+}
   const man = state.crew.find((candidate) => candidate.id === id);
   if (!man) return;
   man.active = !man.active;
@@ -897,6 +1082,10 @@ function shouldAutoEquipBow(man) {
 }
 
 function equipMan(id, slot, value) {
+  if (raidLocked()) {
+  notify("You cannot do that while away on a raid.");
+  return;
+}
   const man = findMan(id);
   if (!man) return;
   if (slot === "weapon") {
@@ -980,6 +1169,10 @@ function equipMan(id, slot, value) {
 }
 
 function unequipAll(man) {
+  if (raidLocked()) {
+  notify("You cannot do that while away on a raid.");
+  return;
+}
   if (man.equipment.weapon && man.equipment.weapon !== "none") state.inventory[man.equipment.weapon] += 1;
   if (man.equipment.shield) state.inventory.shield += 1;
   if (man.equipment.armor === "hauberk") state.inventory.hauberk += 1;
@@ -989,6 +1182,10 @@ function unequipAll(man) {
 }
 
 function autoEquip() {
+  if (raidLocked()) {
+  notify("You cannot do that while away on a raid.");
+  return;
+}
   const sorted = [...state.crew, state.leader].sort((a, b) => effectiveStat(b, "weapon") - effectiveStat(a, "weapon"));
   sorted.forEach((man) => {
     if (man.equipment.weapon === "none") {
@@ -1017,7 +1214,11 @@ function autoEquip() {
   render();
 }
 
-function applyAutoEquip() {                                                                                                                                                     
+function applyAutoEquip() {                                                            
+  if (raidLocked()) {
+  notify("You cannot do that while away on a raid.");
+  return;
+}                                                                                         
                                                                                                                                                                                 
   const crew = [...activeCrew(), state.leader];                                                                                                                                 
                                                                                                                                                                                 
@@ -1026,6 +1227,10 @@ function applyAutoEquip() {
 }                       
 
 function setTraining(id, slot, stat) {
+  if (raidLocked()) {
+  notify("You cannot do that while away on a raid.");
+  return;
+}
   const man = findMan(id);
   if (!man) return;
   if (man.isLeader && ["discipline", "luck"].includes(stat)) return;
@@ -1033,6 +1238,24 @@ function setTraining(id, slot, stat) {
   const options = man.isLeader ? LEADER_TRAINING_STATS : TRAINING_STATS;
   if (!options.includes(stat)) return;
 
+  applyTraining(man, slot, stat, options);
+  render();
+}
+
+function setAllCrewTraining(slot, stat) {
+  if (raidLocked()) {
+  notify("You cannot do that while away on a raid.");
+  return;
+}
+  if (!["primary", "secondary"].includes(slot) || !TRAINING_STATS.includes(stat)) return;
+
+  state.crew.forEach((man) => {
+    applyTraining(man, slot, stat, TRAINING_STATS);
+  });
+  render();
+}
+
+function applyTraining(man, slot, stat, options) {
   if (slot === "primary") {
     if (stat === man.secondary) {
       man.secondary = man.primary;
@@ -1052,7 +1275,6 @@ function setTraining(id, slot, stat) {
       man.primary = other;
     }
   }
-  render();
 }
 
 function findMan(id) {
@@ -1107,74 +1329,148 @@ function startRaid(destination) {
   });
   addLog(`The longship left for ${destination} with ${voyagers} fighting men and ${carried} supplies.`);
   runSeaEvent("outbound");
-  prepareBattle();
   activeView = "raid";
   render();
 }
 
 function runSeaEvent(direction) {
   const chanceGood = clamp(45 + (state.leader.stats.sailing || 0) * 0.5, 5, 90) / 100;
-  if (chance(chanceGood)) goodSeaEvent(direction);
-  else badSeaEvent(direction);
+
+  const text = chance(chanceGood)
+    ? goodSeaEvent(direction)
+    : badSeaEvent(direction);
+
+  state.seaEvent = {
+    direction,
+    text
+  };
+}
+
+function seaEventPopup() {
+  if (!state.seaEvent) return "";
+
+  return `
+    <div class="modalOverlay">
+      <div class="modal">
+        <h2>Sailing Event</h2>
+
+        <p>${state.seaEvent.text}</p>
+
+        <button data-action="continueSeaEvent">
+          Continue
+        </button>
+      </div>
+    </div>
+  `;
 }
 
 function goodSeaEvent(direction) {
   const rollValue = randInt(1, 100);
+
   if (rollValue <= 20) {
     const gain = 7 * (1 + activeCrew().length);
     if (direction === "return") state.supplies += gain;
     else state.raid.carriedSupplies += gain;
-    addLog(`Favorable winds on the ${direction} voyage saved food and time. +${gain} supplies.`);
+
+    const message = `Favorable winds on the ${direction} voyage saved food and time. +${gain} supplies.`;
+    addLog(message);
+    return message;
+
   } else if (rollValue <= 40) {
     state.raid.moraleMod += 15;
-    addLog("A good omen lit the sky. The crew gained +15% morale for the raid.");
+
+    const message = "A good omen lit the sky. The crew gained +15% morale for the raid.";
+    addLog(message);
+    return message;
+
   } else if (rollValue <= 60) {
     const gain = randInt(1, 3);
+
     if (direction === "return") {
       const openSpace = Math.max(0, capacity() - (1 + activeCrew().length));
       const kept = Math.min(gain, openSpace);
       state.slaves += kept;
-      addLog(`A foreign fishing boat was taken. +${kept} captives${gain > kept ? "; the rest could not fit" : ""}.`);
+
+      const message = `A foreign fishing boat was taken. +${kept} captives${gain > kept ? "; the rest could not fit" : ""}.`;
+      addLog(message);
+      return message;
     } else {
       state.raid.pendingSlaves = (state.raid.pendingSlaves || 0) + gain;
-      addLog(`A foreign fishing boat was taken. +${gain} captives if there is space on return.`);
+
+      const message = `A foreign fishing boat was taken. +${gain} captives if there is space on return.`;
+      addLog(message);
+      return message;
     }
+
   } else if (rollValue <= 80) {
     const gain = randInt(20, 40);
     state.gold += gain;
-    addLog(`A pearl was found in a clam meal. +${gain} gold.`);
+
+    const message = `A pearl was found in a clam meal. +${gain} gold.`;
+    addLog(message);
+    return message;
+
   } else {
     const drops = randomEquipmentDrop([3, 4, 5], [0.34, 0.33, 0.33], true);
     addDropsToInventory(drops);
-    addLog(`An abandoned ship drifted by. Gained ${describeDrops(drops)}.`);
+
+    const message = `An abandoned ship drifted by. Gained ${describeDrops(drops)}.`;
+    addLog(message);
+    return message;
   }
 }
 
 function badSeaEvent(direction) {
   const rollValue = randInt(1, 100);
+
   if (rollValue <= 20) {
     const pool = direction === "return" ? state.supplies : state.raid.carriedSupplies;
     const loss = Math.min(pool, randInt(10, 20));
+
     if (direction === "return") state.supplies -= loss;
     else state.raid.carriedSupplies -= loss;
-    addLog(`Sea water ruined stores on the ${direction} voyage. -${loss} supplies.`, "bad");
+
+    const message = `Sea water ruined stores on the ${direction} voyage. -${loss} supplies.`;
+    addLog(message, "bad");
+    return message;
+
   } else if (rollValue <= 40) {
     state.raid.moraleMod -= 10;
-    addLog("A fight over an insult spread through the crew. -10% morale.", "bad");
+
+    const message = "A fight over an insult spread through the crew. -10% morale.";
+    addLog(message, "bad");
+    return message;
+
   } else if (rollValue <= 60) {
     const broken = breakRandomInventory(randInt(1, 2));
-    addLog(`Rough handling broke equipment: ${broken || "nothing worth naming"}.`, "bad");
+
+    const message = `Rough handling broke equipment: ${broken || "nothing worth naming"}.`;
+    addLog(message, "bad");
+    return message;
+
   } else if (rollValue <= 80) {
     const loss = Math.min(state.gold, randInt(10, 30));
     state.gold -= loss;
-    addLog(`Gold was lost to rough waves. -${loss} gold.`, "bad");
+
+    const message = `Gold was lost to rough waves. -${loss} gold.`;
+    addLog(message, "bad");
+    return message;
+
   } else {
     const victim = activeCrew()[randInt(0, Math.max(0, activeCrew().length - 1))];
+
     if (victim) {
       const damage = randInt(2, 4);
       victim.hp = Math.max(1, victim.hp - damage);
-      addLog(`${victim.name} was hurt in a working incident. -${damage} hit points.`, "bad");
+
+      const message = `${victim.name} was hurt in a working incident. -${damage} hit points.`;
+      addLog(message, "bad");
+      return message;
     }
+
+    const message = "A dangerous incident occurred, but no one was injured.";
+    addLog(message, "bad");
+    return message;
   }
 }
 
@@ -1245,7 +1541,6 @@ function scoutEnemy() {
 
 function toggleWall(id) {
   const battle = state.raid.battle;
-  if (id === "leader") return;
   if (battle.stage !== "setup") return;
   if (battle.playerWall.includes(id)) {
     battle.playerWall = battle.playerWall.filter((candidate) => candidate !== id);
@@ -1275,7 +1570,7 @@ function beginBattle() {
   battle.round = 0;
   applyFormation(battle);
   doRangedVolley(battle);
-  battle.message = battle.events.at(-1) || "The shield walls close.";
+  battle.message = battle.events.join("<br>") || "The shield walls close.";
   drawSoon();
   render();
 }
@@ -1373,7 +1668,12 @@ function applyFormation(battle) {
   const command = effectiveStat(state.leader, "command");
   const discipline = average(wallMen.map((man) => effectiveStat(man, "discipline")));
   const morale = average(wallMen.map((man) => effectiveStat(man, "morale")));
-  const score = randInt(1, 100) + command * 0.35 + discipline * 0.2 + morale * 0.1;
+  const score =
+  randInt(1, 100) +
+  command * 0.35 +
+  discipline * 0.2 +
+  morale * 0.1 +
+  shields;
   let degree = 0;
   if (score >= 135) degree = 3;
   else if (score >= 105) degree = 2;
@@ -1416,24 +1716,37 @@ function liveEnemyWall(battle) {
 }
 
 function doRangedVolley(battle) {
-  const playerArchers = livePlayerWall(battle).filter((man) => man.equipment.bow);
-  const enemyArchers = liveEnemyWall(battle).filter((man) => man.equipment.bow);
+  const playerArchers = livePlayerWall(battle).filter(man => man.equipment.bow);
+  const enemyArchers = liveEnemyWall(battle).filter(man => man.equipment.bow);
+
   let playerShots = playerArchers.length + battle.rangedBonus;
   let enemyShots = enemyArchers.length;
-  let text = [];
+
   while (playerShots > 0 && liveEnemyWall(battle).length) {
-    const shooter = playerArchers[playerShots % Math.max(1, playerArchers.length)] || livePlayerWall(battle)[0];
+    const shooter =
+      playerArchers[playerShots % Math.max(1, playerArchers.length)] ||
+      livePlayerWall(battle)[0];
+
     const target = pick(liveEnemyWall(battle));
-    if (resolveAttack(shooter, target, battle, true, "player")) text.push(`${shooter.name} struck with a bow.`);
-    playerShots -= 1;
+
+    const message = resolveAttack(shooter, target, battle, true, "player");
+    if (message) battle.events.push(message);
+
+    playerShots--;
   }
+
   while (enemyShots > 0 && livePlayerWall(battle).length) {
-    const shooter = enemyArchers[enemyShots % Math.max(1, enemyArchers.length)] || liveEnemyWall(battle)[0];
+    const shooter =
+      enemyArchers[enemyShots % Math.max(1, enemyArchers.length)] ||
+      liveEnemyWall(battle)[0];
+
     const target = pick(livePlayerWall(battle));
-    if (resolveAttack(shooter, target, battle, true, "enemy")) text.push(`Enemy arrows found ${target.name}.`);
-    enemyShots -= 1;
+
+    const message = resolveAttack(shooter, target, battle, true, "enemy");
+    if (message) battle.events.push(message);
+
+    enemyShots--;
   }
-  if (text.length) battle.events.push(text.slice(0, 3).join(" "));
 }
 
 function pick(items) {
@@ -1468,37 +1781,25 @@ function sideAttacks(side, battle) {
 
   if (!attackers.length || !defenders.length) return "";
 
-  const count = Math.max(
-    1,
-    attackers.filter((attacker, index) =>
-      chance(attackChance(attacker, battle, side, index))
-    ).length
-  );
+  const attackingMen = attackers.filter((attacker, index) =>
+  chance(attackChance(attacker, battle, side, index))
+);
+
+if (!attackingMen.length) {
+  attackingMen.push(pick(attackers));
+}
 
   const messages = [];
 
-  for (let i = 0; i < count; i += 1) {
+  for (const attacker of attackingMen) {
+
     const attacker = pick(attackers);
     const defender = pick(defenders);
 
-    const beforeHp = defender.hp;
+    const message = resolveAttack(attacker, defender, battle, false, side);
 
-    const dealt = resolveAttack(attacker, defender, battle, false, side);
-
-    if (dealt > 0) {
-      if (defender.hp <= 0 && beforeHp > 0) {
-        messages.push(
-          `${attacker.name} kills ${defender.name} (${dealt} damage)`
-        );
-      } else {
-        messages.push(
-          `${attacker.name} hits ${defender.name} for ${dealt} damage`
-        );
-      }
-    } else {
-      messages.push(
-        `${attacker.name} misses ${defender.name}`
-      );
+    if (message) {
+      messages.push(message);
     }
   }
 
@@ -1516,11 +1817,13 @@ function attackChance(attacker, battle, side, index) {
 }
 
 function resolveAttack(attacker, defender, battle, ranged = false, side = "player") {
-  if (!attacker || !defender || attacker.hp <= 0 || defender.hp <= 0) return 0;
+  if (!attacker || !defender || attacker.hp <= 0 || defender.hp <= 0) return null;
+
   const weapon = EQUIPMENT[attacker.equipment.weapon] || {};
   const statKey = ranged ? "ranged" : "weapon";
   const staminaPenalty = attacker.staminaNow < 20 ? 0.5 : 1;
   const moraleRoll = moraleModifier(side, battle);
+
   const hitChance = clamp(
     (ranged ? 0.15 : 0.6) +
       effectiveStat(attacker, statKey) * (ranged ? 0.006 : 0.003) * staminaPenalty +
@@ -1528,42 +1831,66 @@ function resolveAttack(attacker, defender, battle, ranged = false, side = "playe
       moraleRoll -
       effectiveStat(defender, "agility") * 0.001,
     0.05,
-    0.95,
+    0.95
   );
-  attacker.staminaNow = clamp((attacker.staminaNow || 100) - (ranged ? 4 : 8));
-  if (!chance(hitChance)) return 0;
-  const armor = (defender.equipment.armor === "hauberk" ? 2 : 0) + (defender.equipment.helm === "helm" ? 1 : 0);
-  const base = randInt(1, 5);
-  const strengthBonus = ranged
-  ? 0
-  : effectiveStat(attacker, "strength") * 0.1 * staminaPenalty;
 
-const damage = Math.max(
-  0,
-  round(
-    base +
-    strengthBonus +
-    (weapon.damage || 0) -
-    armor
-  )
-);
-  if (damage <= 0) return 0;
+  attacker.staminaNow = clamp((attacker.staminaNow || 100) - (ranged ? 4 : 8));
+
+  // Miss
+  if (!chance(hitChance)) {
+    return ranged
+      ? `${attacker.name} shot at ${defender.name} but missed.`
+      : `${attacker.name} attacked ${defender.name} but missed.`;
+  }
+
+  const armor =
+    (defender.equipment.armor === "hauberk" ? 2 : 0) +
+    (defender.equipment.helm === "helm" ? 1 : 0);
+
+  const base = randInt(1, 5);
+
+  const strengthBonus = ranged
+    ? 0
+    : effectiveStat(attacker, "strength") * 0.1 * staminaPenalty;
+
+  const damage = Math.max(
+    0,
+    round(base + strengthBonus + (weapon.damage || 0) - armor)
+  );
+
+  if (damage <= 0) {
+    return `${attacker.name}'s attack failed to penetrate ${defender.name}'s armor.`;
+  }
+
   defender.hp = Math.max(0, defender.hp - damage);
   defender.staminaNow = clamp((defender.staminaNow || 100) - 4);
+
   attacker.battle.damageDealt += damage;
   defender.battle.damageTaken += damage;
+
   if (side === "player") battle.enemyMorale -= 5;
   else battle.playerMorale -= 5;
+
   if (damage > 2 && chance((damage - 2) * 0.05)) {
     inflictInjury(defender, attacker, battle, side);
   }
+
   if (defender.hp <= 0) {
     attacker.battle.kills += 1;
+
     if (side === "player") battle.enemyMorale -= 10;
     else battle.playerMorale -= 10;
+
     incapacitate(defender);
+
+    return ranged
+      ? `${attacker.name} shot ${defender.name} for ${damage} damage, killing him.`
+      : `${attacker.name} struck ${defender.name} for ${damage} damage, killing him.`;
   }
-  return damage;
+
+  return ranged
+    ? `${attacker.name} shot ${defender.name} for ${damage} damage.`
+    : `${attacker.name} struck ${defender.name} for ${damage} damage.`;
 }
 
 function moraleModifier(side, battle) {
@@ -1673,12 +2000,13 @@ function rally() {
 
 function endBattle(playerWon) {
   const battle = state.raid.battle;
+  const importedOpponent = state.raid.importedOpponent;
   battle.stage = "ended";
   rout(playerWon, battle);
-  trainAfterBattle(playerWon);
+  if (!importedOpponent) trainAfterBattle(playerWon);
 
   const deadCrew = state.crew.filter((man) => man.dead);
-  const casualtySummary = deadCrew.length
+  const casualtySummary = !importedOpponent && deadCrew.length
     ? ` ${deadCrew.length} crew member${deadCrew.length === 1 ? "" : "s"} died: ${deadCrew.map((man) => man.name).join(", ")}.`
     : "";
 
@@ -1692,7 +2020,9 @@ battle.playerMorale = Math.min(
 );
 const report = grantSpoils(battle);
     state.raid.report = { ...report, casualties: casualtySummary };
-    battle.message = `The enemy routs. Spoils taken: ${report.playerGold} gold share, ${report.supplies} supplies, ${report.slaves} captives, ${describeDrops(report.equipment)}.${casualtySummary}`;
+    battle.message = report.noSpoils
+      ? `The rival warband routs. This was a contest of shield walls, not a raid for spoils.${casualtySummary}`
+      : `The enemy routs. Spoils taken: ${report.playerGold} gold share, ${report.supplies} supplies, ${report.slaves} captives, ${describeDrops(report.equipment)}.${casualtySummary}`;
     addLog(`Victory at the ${battle.target}. ${battle.message}`);
   } else {
     battle.message = `Your shield wall broke. The crew dragged itself back to the ships.${casualtySummary}`;
@@ -1700,7 +2030,43 @@ const report = grantSpoils(battle);
     addLog(`Defeat at the ${battle.target}.`, "bad");
   }
   removeDeadCrew();
+  if (importedOpponent) restoreAfterImportedOpponentBattle(battle);
   render();
+}
+
+function restoreAfterImportedOpponentBattle(battle) {
+  const snapshot = state.raid.preBattleState;
+  const snapshotView = state.raid.preBattleView;
+  const report = state.raid.report;
+  if (!snapshot) return;
+
+  state = cloneGameState(snapshot);
+  state.raid = {
+    destination: battle.target,
+    targetIndex: 0,
+    carriedSupplies: state.supplies,
+    suggested: 0,
+    moraleMod: 0,
+    formation: "reinforceCenter",
+    scouted: true,
+    scoutInfo: null,
+    battle: {
+      stage: "ended",
+      target: battle.target,
+      round: battle.round,
+      message: battle.message,
+      events: [...(battle.events || [])],
+      enemies: [],
+      enemyWall: [],
+      playerWall: [],
+      reserves: [],
+    },
+    report,
+    complete: true,
+    importedOpponent: true,
+    preBattleState: cloneGameState(snapshot),
+    preBattleView: snapshotView,
+  };
 }
 
 function rout(playerWon, battle) {
@@ -1721,8 +2087,36 @@ function rout(playerWon, battle) {
 }
 
 function grantSpoils(battle) {
+  if (state.raid.importedOpponent) {
+    return {
+      rawGold: 0,
+      playerGold: 0,
+      xp: 0,
+      supplies: 0,
+      equipment: {},
+      slaves: 0,
+      lostSlaves: 0,
+      noSpoils: true,
+      lines: battleReportLines(battle),
+    };
+  }
+
   const target = TARGETS[state.raid.targetIndex];
   const dest = DESTINATIONS[state.raid.destination];
+  if (!target || !dest) {
+    return {
+      rawGold: 0,
+      playerGold: 0,
+      xp: 0,
+      supplies: 0,
+      equipment: {},
+      slaves: 0,
+      lostSlaves: 0,
+      noSpoils: true,
+      lines: battleReportLines(battle),
+    };
+  }
+
   const rawGold = ceil(randInt(target.gold[0], target.gold[1]) * dest.spoils);
   const shares = activeCrew().length + 3;
   const playerGold = ceil(rawGold * (3 / shares));
@@ -1748,7 +2142,7 @@ function grantSpoils(battle) {
     supplies,
     equipment,
     slaves,
-    lostSalves: possibleSlaves - slaves,
+    lostSlaves: possibleSlaves - slaves,
     lines: battleReportLines(battle),
   };
 }
@@ -1893,6 +2287,10 @@ function removeDeadCrew() {
 
 function continueRaid() {
   if (!state.raid || !state.raid.report || state.raid.report.defeat) return;
+  if (state.raid.importedOpponent) {
+    returnHome();
+    return;
+  }
   if (state.raid.targetIndex >= TARGETS.length - 1) {
     returnHome();
     return;
@@ -1914,17 +2312,45 @@ function continueRaid() {
 
 function returnHome() {
   if (!state.raid) return;
+
+  if (state.raid.importedOpponent) {
+    const snapshot = state.raid.preBattleState;
+    const snapshotView = state.raid.preBattleView;
+    if (snapshot) {
+      state = cloneGameState(snapshot);
+      activeView = snapshotView || "home";
+    } else {
+      state.raid = null;
+      activeView = "home";
+    }
+    render();
+    playMusic(state.raid ? "raid" : "home");
+    return;
+  }
   runSeaEvent("return");
+
+  render();
+}
+
+function finishReturnHome() {
   const income = passiveIncome();
+
   state.gold += income;
   state.voyageCount += 1;
   state.turn = (state.turn || 1) + 1;
   state.sowedFields = 0;
+
   healInjuries();
   refreshRecruits(false);
+
   state.raid = null;
   activeView = "home";
-  addLog(`Returned to the Home Fjord. Farms, fields, and slaves produced ${income} gold.`);
+
+  addLog(
+    `Returned to the Home Fjord. Farms, fields, and slaves produced ${income} gold.`
+  );
+
+  playMusic("home");
   render();
 }
 
@@ -1982,7 +2408,7 @@ function leaderStatPills(leader) {
   return `
     <h4>Combat Stats</h4>
     <div class="stat-grid">
-      ${COMBAT_STATS.map(key =>
+      ${LEADER_COMBAT_STATS.map(key =>
         `<span class="stat-pill">
           <span>${STAT_DEFS[key]}</span>
           <strong>${formatStat(leader.stats[key] || 0)}</strong>
@@ -2022,7 +2448,6 @@ function render() {
       <aside class="side">
         <div class="brand">
           <h1>Shield Wall</h1>
-          <p>Viking management and raid combat</p>
         </div>
         <nav class="nav">
           ${navButton("home", "Home Fjord")}
@@ -2031,6 +2456,7 @@ function render() {
           ${navButton("raid", "Raid")}
           ${navButton("crew", "Crew")}
           ${navButton("log", "Log")}
+          ${navButton("help", "Help")}
         </nav>
         <div class="save-row">
           <button data-action="save">Save</button>
@@ -2045,6 +2471,7 @@ function render() {
         ${viewHtml()}
       </main>
     </div>
+    ${seaEventPopup()}
   `;
   drawSoon();
 }
@@ -2101,6 +2528,7 @@ function viewHtml() {
   if (activeView === "store") return storeView();
   if (activeView === "raid") return raidView();
   if (activeView === "crew") return crewView();
+  if (activeView === "help") return helpView();
   return logView();
 }
 
@@ -2121,16 +2549,21 @@ function homeView() {
         </div>
         <div class="card">
           <h3>Fields</h3>
-          <p>Sowed fields add 40 gold for one voyage. Limit: ${1 + state.land} before each voyage.</p>
+          <p>Sown fields add 40 gold for 1 month. Limit: ${1 + state.land} before each voyage.</p>
           <p>Sowed now: <strong>${state.sowedFields}</strong></p>
           <button data-action="sowField">Sow fields (20 gold)</button>
         </div>
         <div class="card">
-          <h3>Slave Work</h3>
+          <h3>Slaves</h3>
           <p>Each slave adds 5 gold per voyage and requires longship space only when first brought home.</p>
-          <button data-action="buySlave">Buy slave (20 gold)</button>
+          <button data-action="buySlave">Buy slave (${slaveCost()} gold)</button>
         </div>
       </div>
+      <div class="card">
+  <h3>Pass the Month</h3>
+  <p>Remain at the fjord and let one month pass without raiding.</p>
+  <button data-action="skipTurn">Pass Month</button>
+</div>
     </section>
     <section class="panel">
       <div class="panel-head">
@@ -2146,13 +2579,74 @@ function homeView() {
   `;
 }
 
+function helpView() {
+  return `
+    <div class="helpBox">
+
+      <h2>Help</h2>
+
+      <h3>Combat Stats</h3>
+
+      <p><b>Weapon Skill</b> - +0.3% chance to hit per point.</p>
+      <p><b>Ranged Skill</b> - +0.6% chance to hit per point.</p>
+      <p><b>Strength</b> - +0.1 damage per point.</p>
+      <p><b>Agility</b> - +0.1% chance to act per point.</p>
+      <p><b>Toughness</b> - +0.2 maximum hit points per point.</p>
+      <p><b>Recovery</b> - +0.2 stamina recovered per point.</p>
+      <p><b>Stamina</b> - Low stamina reduces combat effectiveness.</p>
+      <p><b>Morale</b> - When morale runs out your shield wall breaks and flees.</p>
+      <p><b>Discipline</b> - Higher discipline improves formation success.</p>
+      <p><b>Speed</b> - +0.35% initiative per point.</p>
+
+      <h3>Auxiliary Stats</h3>
+
+      <p><b>Intelligence</b> - Increases training gains.</p>
+      <p><b>Trainer</b> - Improves training for the crew.</p>
+      <p><b>Pillaging</b> - Increases loot gained from raids.</p>
+      <p><b>Repair</b> - Improves repair efficiency.</p>
+      <p><b>Manhunting</b> - Increases slave capture chance.</p>
+      <p><b>Luck</b> - Reduces chance of injury.</p>
+
+      <h3>Leader Stats</h3>
+
+      <p><b>Command</b> - Improves formation success.</p>
+      <p><b>Management</b> - Improves passive gold income.</p>
+      <p><b>Sailing</b> - Improves chance of positive random events.</p>
+
+      <h3>Shield Wall</h3>
+
+      <p>A shield wall requires at least <b>5 shields</b>.</p>
+
+      <p>Every shield equipped grants <b>+1 formation score</b>.</p>
+
+      <h3>Formations</h3>
+
+      <p><b>Boar's Snout</b> - Lowers enemy morale.</p>
+      <p><b>Reinforce Center</b> - Raises your morale.</p>
+      <p><b>Reinforce Ends</b> - Strengthens both flanks.</p>
+      <p><b>Take the Field</b> - Improves ranged combat.</p>
+
+      <h3>Training</h3>
+
+      <p>Training after battle depends on Intelligence and Trainer.</p>
+
+      <h3>Equipment</h3>
+
+      <p><b>Weapons</b> increase damage.</p>
+      <p><b>Armor</b> reduces incoming damage.</p>
+      <p><b>Shields</b> are required for shield wall formations.</p>
+
+    </div>
+  `;
+}
+
 function recruitView() {
   return `
     <section class="panel">
       <div class="panel-head">
-        <h2>Recruitment Tent</h2>
+        <h2>Recruitments</h2>
         <div class="actions">
-          <button data-action="enlargeTent">Enlarge tent (${tentCost()} gold)</button>
+          <button data-action="enlargeTent">Enlarge (${tentCost()} gold)</button>
         </div>
       </div>
       <div class="panel-body">
@@ -2215,14 +2709,40 @@ function storeView() {
         <span class="muted">Equipment sells for half value rounded down.</span>
       </div>
       <div class="panel-body">
+
+        <div class="card">
+          <h3>Equipment Guide</h3>
+
+          <p><strong>Shield</strong> – Required for shield wall formations. Bring at least 5 men with shields to avoid a 25% moral penalty. Each shield in the wall gives <strong>+1 formation score</strong>.</p>
+
+          <p><strong>Spear</strong> – One-handed weapon, +2% chance to attack.</p>
+
+          <p><strong>Axe</strong> – One-handed weapon, +2 damage.</p>
+
+          <p><strong>Sword</strong> – High quality one-handed weapon +1% chance to attack, +1% damage and +1% chance to hit.</p>
+
+          <p><strong>Dane Axe</strong> – Powerful two-handed weapon that deals +3 damage but cannot be used with a shield.</p>
+
+          <p><strong>Hauberk</strong> – Mail armor that reduces incoming damage by 2.</p>
+
+          <p><strong>Helm</strong> – Head protection that reduces incoming damage by 1.</p>
+
+          <p><strong>Bow</strong> – Allows a warrior to make a single ranged attack before melee begins. Does not restrict melee equipment.</p>
+        </div>
+
         <div class="grid three">
           <div class="card">
             <h3>Supplies</h3>
-            <p>One supply feeds one man for one day.</p>
+            <p>Cost: 1 gold. One supply feeds one man for one day.</p>
             <div class="actions">
-              ${[1, 5, 20, 50, 100].map((amount) => `<button data-action="buySupplies" data-amount="${amount}">Buy ${amount}</button>`).join("")}
+              ${[1, 5, 20, 50, 100].map((amount) =>
+  `<button data-action="buySupplies" data-amount="${amount}">Buy ${amount}</button>`
+).join("")}
+
+<button data-action="buyMaxSupplies">Buy Max</button>
             </div>
           </div>
+
           ${storeItem("shield")}
           ${storeItem("spear")}
           ${storeItem("axe")}
@@ -2231,6 +2751,7 @@ function storeView() {
           ${storeItem("hauberk")}
           ${storeItem("helm")}
           ${storeItem("bow")}
+
           <div class="card">
             <h3>Longship</h3>
             <p>Cost: 60 gold. Carries 10 men.</p>
@@ -2238,6 +2759,7 @@ function storeView() {
             <button data-action="buyItem" data-item="longship">Buy longship</button>
           </div>
         </div>
+
       </div>
     </section>
   `;
@@ -2259,6 +2781,15 @@ function storeItem(item) {
 function raidView() {
   if (!state.raid) return raidSetupView();
   const battle = state.raid.battle;
+  if (!battle) {
+    return `
+      <section class="panel">
+        <div class="panel-body">
+          <p class="muted">The longship is underway.</p>
+        </div>
+      </section>
+    `;
+  }
   if (state.raid.report) return reportView();
   if (battle.stage === "setup") return battleSetupView();
   return combatView();
@@ -2464,7 +2995,7 @@ function combatFighter(man) {
 function reportView() {
   const battle = state.raid.battle;
   const report = state.raid.report;
-  const canContinue = !report.defeat && state.raid.targetIndex < TARGETS.length - 1;
+  const canContinue = !report.defeat && !state.raid.importedOpponent && state.raid.targetIndex < TARGETS.length - 1;
   const cost = ceil(state.raid.suggested * 0.25);
   return `
     <section class="panel">
@@ -2480,7 +3011,9 @@ function reportView() {
           <h3>Outcome</h3>
           <p>${battle.message}</p>
           ${report.casualties ? `<p class="muted">${report.casualties}</p>` : ""}
-          ${report.defeat ? "" : `
+          ${report.defeat ? "" : report.noSpoils ? `
+            <p class="muted">Imported opponent battles do not award raid spoils.</p>
+          ` : `
             <div class="badge-row">
               <span class="badge">Total gold ${report.rawGold}</span>
               <span class="badge">Jarl share ${report.playerGold}</span>
@@ -2528,6 +3061,11 @@ function crewView() {
         <h2>Crew</h2>
         <div class="actions">
           <button data-action="autoEquip">Auto Equip</button>
+          <select data-role="crewTrainingStat">
+            ${TRAINING_STATS.map((stat) => `<option value="${stat}">${STAT_DEFS[stat]}</option>`).join("")}
+          </select>
+          <button class="secondary" data-action="bulkTraining" data-slot="primary">All Primary</button>
+          <button class="secondary" data-action="bulkTraining" data-slot="secondary">All Secondary</button>
           <button class="secondary" data-action="sortCrew" data-sort="hp">Sort HP</button>
           <button class="secondary" data-action="sortCrew" data-sort="stamina">Sort Stamina</button>
           <button class="secondary" data-action="sortCrew" data-sort="injury">Sort Injuries</button>
@@ -2566,7 +3104,7 @@ function crewRow(man) {
   <span class="tiny muted">${injuryText(man)}</span>
   <h4>Combat Stats</h4>
 <div class="stat-grid">
-  ${COMBAT_STATS.map(key =>
+  ${(man.isLeader ? LEADER_COMBAT_STATS : COMBAT_STATS).map(key =>
     `<span class="stat-pill">
       <span>${STAT_DEFS[key]}</span>
       <strong>${formatStat(man.stats[key] || 0)}</strong>
@@ -2694,8 +3232,6 @@ function drawBattle() {
     ctx.fillRect(0, 0, width, height);
   }
 
-  ctx.fillStyle = "rgba(44, 122, 123, 0.55)";
-  ctx.fillRect(0, 0, width, 92);
   ctx.fillStyle = "rgba(91, 53, 34, 0.35)";
   for (let i = 0; i < 8; i += 1) {
     ctx.fillRect(i * 130 - 30, 260 + (i % 2) * 18, 90, 8);
@@ -2778,16 +3314,6 @@ function drawMan(ctx, x, y, color, man, facingRight, scale = 1) {
   ctx.restore();
 }
 
-function drawLabels(ctx, battle) {
-  ctx.fillStyle = "rgba(47, 29, 23, 0.82)";
-  ctx.font = "20px Segoe UI, sans-serif";
-  ctx.fillText("Your Shield Wall", 54, 128);
-  ctx.fillText("Enemy Force", 720, 128);
-  ctx.font = "14px Segoe UI, sans-serif";
-  ctx.fillText(`Round ${battle.round}`, 412, 42);
-  ctx.fillText(`Formation degree ${battle.formationDegree}`, 380, 64);
-}
-
 app.addEventListener("click", (event) => {
   const button = event.target.closest("button");
   if (!button) return;
@@ -2817,11 +3343,13 @@ app.addEventListener("click", (event) => {
   if (action === "save") saveGame();
   if (action === "reset") resetGame();
   if (action === "buySupplies") buySupplies(Number(button.dataset.amount));
+  if (action === "buyMaxSupplies") buyMaxSupplies();
   if (action === "buyItem") buyItem(button.dataset.item);
   if (action === "sellItem") sellItem(button.dataset.item);
   if (action === "buyLand") buyLand();
   if (action === "sowField") sowField();
   if (action === "buySlave") buySlave();
+  if (action === "skipTurn") skipTurn();
   if (action === "enlargeTent") enlargeTent();
   if (action === "refreshRecruits") {
     refreshRecruits(false);
@@ -2830,12 +3358,19 @@ app.addEventListener("click", (event) => {
   if (action === "hire") hireRecruit(button.dataset.id);
   if (action === "fire") fireCrew(button.dataset.id);
   if (action === "toggleActive") toggleCrewActive(button.dataset.id);
+  if (action === "bulkTraining") {
+    const selected = app.querySelector('[data-role="crewTrainingStat"]')?.value;
+    setAllCrewTraining(button.dataset.slot, selected);
+  }
   if (action === "sortCrew") {
     state.crewSort = button.dataset.sort;
     render();
   }
   if (action === "autoEquip") autoEquip();
-  if (action === "startRaid") startRaid(button.dataset.destination);
+  if (action === "startRaid") {
+  startRaid(button.dataset.destination);
+  return;
+}
   if (action === "scout") scoutEnemy();
   if (action === "sortRaidCrew") {
     if (state.raid) {
@@ -2849,6 +3384,22 @@ app.addEventListener("click", (event) => {
   if (action === "swap") swapFighters();
   if (action === "rally") rally();
   if (action === "continueRaid") continueRaid();
+  if (action === "continueSeaEvent") {
+  const direction = state.seaEvent.direction;
+
+  state.seaEvent = null;
+
+  if (direction === "outbound") {
+    playMusic("raid");
+    prepareBattle();
+    activeView = "raid";
+    render();
+  } else {
+    finishReturnHome();
+  }
+
+  return;
+}
   if (action === "returnHome") returnHome();
 });
 
